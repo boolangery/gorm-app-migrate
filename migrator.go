@@ -7,6 +7,8 @@ import (
 	"gorm.io/gorm"
 )
 
+const ResetMigrations = "zero"
+const InitMigration = "init"
 
 type GormMigration interface {
 	GetID() string
@@ -91,15 +93,24 @@ func Migrate(db *gorm.DB, app Application) (MigrationsStatus, error) {
 
 	err := db.Transaction(func(tx *gorm.DB) error {
 		for _, m := range app.Migrations() {
-			// check if migration is applied
-			var dbMigration Migration
-			result := db.Where(&Migration{MigrationID: m.GetID(), AppName: app.Name()}).First(&dbMigration)
-			if IsDBError(result) {
-				return errors.Wrap(result.Error, "cannot fetch migration")
+			apply := false
+
+			// run "init" migration everytime
+			if m.GetID() == InitMigration {
+				apply = true
+			} else {
+				// check if migration is applied
+				var dbMigration Migration
+				result := db.Where(&Migration{MigrationID: m.GetID(), AppName: app.Name()}).First(&dbMigration)
+				if IsDBError(result) {
+					return errors.Wrap(result.Error, "cannot fetch migration")
+				}
+
+				apply = errors.Is(result.Error, gorm.ErrRecordNotFound)
 			}
 
 			// if migrations not applied
-			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			if apply {
 				if state, err := applyMigration(db, app, m, true); err != nil {
 					return errors.Wrap(err, "cannot apply migration: "+m.GetID())
 				} else {
@@ -139,7 +150,7 @@ func MigrateTo(db *gorm.DB, app Application, migrationID string) (MigrationsStat
 			break
 		}
 	}
-	if !exists && migrationID != "zero" {
+	if !exists && migrationID != ResetMigrations {
 		return states, errors.New("migration do not exists: " + migrationID)
 	}
 
@@ -155,7 +166,7 @@ func MigrateTo(db *gorm.DB, app Application, migrationID string) (MigrationsStat
 
 	err := db.Transaction(func(tx *gorm.DB) error {
 		// if applied, unapply migration after
-		if migrationID == "zero" || applied(migrationID) {
+		if migrationID == ResetMigrations || applied(migrationID) {
 			logger.WithField("migration", migrationID).Debug("migration already applied")
 
 			for i := len(app.Migrations()) - 1; i >= 0; i-- { // go in reverse order
@@ -177,7 +188,16 @@ func MigrateTo(db *gorm.DB, app Application, migrationID string) (MigrationsStat
 			logger.WithField("migration", migrationID).Debug("migration is not applied")
 
 			for _, m := range app.Migrations() {
-				if !applied(m.GetID()) {
+				apply := false
+
+				// run "init" migration if no migrations applied
+				if len(dbMigrations) == 0 && m.GetID() == InitMigration {
+					apply = true
+				} else {
+					apply = !applied(m.GetID())
+				}
+
+				if apply {
 					logger.WithField("migration", m.GetID()).Debug("applying migration")
 					if state, err := applyMigration(db, app, m, true); err != nil {
 						return err
